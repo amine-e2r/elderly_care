@@ -6,6 +6,10 @@ from sklearn.pipeline import Pipeline
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.preprocessing import StandardScaler
 
+# Recolt the data via Bluetooth
+
+
+
 # Import the models
 random_forest_model = joblib.load("random_forest_model.pkl")
 isolation_forest_model = joblib.load("isolation_forest_model.pkl")
@@ -59,12 +63,17 @@ class BeatsExtractor(BaseEstimator, TransformerMixin):
         X: (n_samples,) ECG signal brut
         """
         peaks, _ = signal.find_peaks(X, distance=self.sample_rate*0.3)
+        target_len = int( (0.2 + 0.4) * self.sample_rate)
+        
         beats = []
         for peak in peaks:
             start = max(0, peak - int(0.2 * self.sample_rate))  # 200ms before
             end = min(len(X), peak + int(0.4 * self.sample_rate))  # 400ms after
-            beats.append(X[start:end])
-        return np.array(beats) # (n_beats, n_samples) each line is a beat segment
+            
+            if start >= 0 and end <= len(X):
+                beats.append(X[start:end])
+        
+        return np.array(beats) # (n_beats, n_samples/target_len) each line is a beat segment
 
 #Beats Window sliding | Input : Beats | Output : Windows of beats
 class BeatsWindowing(BaseEstimator, TransformerMixin):
@@ -104,7 +113,7 @@ class HRVFeaturesExtractor(BaseEstimator, TransformerMixin):
             pnn50 = 100 * np.sum(np.abs(np.diff(rr_window)) > 50) / len(rr_window)
             features.append([rr_mean, sdnn, rmssd, pnn50])
 
-        return features
+        return np.array(features)
 
 # Morphological features extractor | Input : Beats windows| Output : Morphological features
 class MorphologicalFeaturesExtractor(BaseEstimator, TransformerMixin):
@@ -120,16 +129,21 @@ class MorphologicalFeaturesExtractor(BaseEstimator, TransformerMixin):
         """
         features = []
         for beat_window in X:
+            window_features = []
             for beat in beat_window:
                 beat_amplitude = np.max(beat) - np.min(beat)
                 beat_mean = np.mean(beat)
                 beat_energy = np.sum(beat ** 2)
                 qrs_slope = np.max(np.diff(beat))
-                features.append([beat_amplitude, beat_mean, beat_energy, qrs_slope])
-        return features
+                
+                window_features.append([beat_amplitude, beat_mean, beat_energy, qrs_slope])
+            
+            window_features = np.mean(window_features, axis=0)
+            features.append(window_features)
+        return np.array(features) # (n_windows, 4) each line is the mean morphological features of the beats in the window
 
 # Union of HRV and morphological features | Input : RR intervals windows and Beats windows | Output : Concatenation of HRV and morphological
-class FeatureUnion(BaseEstimator, TransformerMixin):
+class ECGFeatureUnion(BaseEstimator, TransformerMixin):
     def __init__(self,sample_rate, window_size, step_size = None):
         self.sample_rate = sample_rate
         self.window_size = window_size
@@ -168,6 +182,8 @@ class FeatureUnion(BaseEstimator, TransformerMixin):
         
         return np.hstack((hrv_features, morph_features))
 
+# Pipelines creation
+
 sample_rate = 130
 window_size = 10
 step_size = 5
@@ -180,7 +196,7 @@ stress_pipeline = Pipeline([
 ])
 
 anomaly_pipeline = Pipeline([
-    ("features", FeatureUnion(sample_rate=sample_rate, window_size=window_size, step_size=step_size)),
+    ("features", ECGFeatureUnion(sample_rate=sample_rate, window_size=window_size, step_size=step_size)),
     ("standard_scaler", StandardScaler()),
     ("isolation_forest", isolation_forest_model)
 ])

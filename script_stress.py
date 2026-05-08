@@ -5,7 +5,10 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import GroupKFold
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from scipy.signal import butter, filtfilt
+import matplotlib.pyplot as plt
+import seaborn as sns
 from copy import deepcopy
 
 
@@ -49,6 +52,14 @@ for subject in patients_data:
     df_clean = df_clean.reset_index(drop=True)
     
     patients_data[subject] = df_clean
+    
+# We apply a bandpass filter to the ECG signal to remove noise and artifacts
+
+def bandpass_filter(X, fs):
+    low,high = 5, 40 
+    nyq = 0.5 * fs
+    b, a = butter(2, [low/nyq, high/nyq], btype='band')
+    return filtfilt(b, a, X) 
 
 # We extract the RR intervals from the ECG signal for each patient
 sampling_rate_wesad = 700  # WESAD ECG sampling frequency in Hz (samplesper second)
@@ -57,6 +68,9 @@ patients_rr_intervals = {}
 for subject, patient_df in patients_data.items():
     ecg_signal = patient_df["ECG"].to_numpy()
     labels_signal = patient_df["label"].to_numpy()
+
+    # Apply bandpass filter
+    ecg_signal = bandpass_filter(ecg_signal, sampling_rate_wesad)
 
     peaks, _ = scipy.signal.find_peaks(
         ecg_signal,
@@ -139,21 +153,106 @@ for subject, rr_df in patients_rr_intervals.items():
         window_rows.append(features)
 
 wesad_window_df = pd.DataFrame(window_rows)
+wesad_window_df["label"] = (wesad_window_df["label"] == 2).astype(int)
 
-wesad_window_df.to_csv("dataset/wesad_hrv_dataset_made_10.csv", index=False)
+# We load collected data
+COLLECTED_DATA_PATH = "dataset/collected/cleaned/"
+sampling_rate_collected = 130
+
+
+collected_data = {}
+collected_rr_intervals = {}
+
+# Load each CSV file from collected/cleaned
+for filename in os.listdir(COLLECTED_DATA_PATH):
+    if not filename.lower().endswith(".csv"):
+        continue
+    
+    file_path = os.path.join(COLLECTED_DATA_PATH, filename)
+    df = pd.read_csv(file_path)
+    
+    # Last two columns are subject and stress (added by script_clean_raw_data)
+    if df.shape[1] >= 2:
+        subject = df["subject"].iloc[0]  # subject column
+        stress = df["stress"].iloc[0]  # stress column
+        # All columns except last two are ECG signal
+        ecg_signal = df.iloc[:, :-2].values.flatten()
+    else:
+        # Fallback: entire row is ECG
+        subject = filename
+        stress = 1 if "stress" in filename.lower() else 0
+        ecg_signal = df.iloc[:, :].values.flatten()
+    
+    ecg_signal = bandpass_filter(ecg_signal, sampling_rate_collected)
+    # Store in dictionary by filename
+    collected_data[filename] = {
+        "ECG": ecg_signal,
+        "subject": subject,
+        "stress": stress
+    }
+    
+    # Calculate RR intervals
+    peaks, _ = scipy.signal.find_peaks(ecg_signal,
+        distance=int(0.3 * sampling_rate_collected),
+        prominence=max(0.15, 0.5 * np.std(ecg_signal)),
+    )
+    
+    if len(peaks) > 1:
+        rr_interval_ms = np.diff(peaks) * 1000 / sampling_rate_collected
+        collected_rr_intervals[filename] = pd.DataFrame({
+            "rr_interval_ms": rr_interval_ms,
+            "subject": subject,
+            "stress": stress
+        })
+
+# Extract HRV features from collected data
+collected_window_rows = []
+
+for filename, rr_df in collected_rr_intervals.items():
+    if rr_df.empty or len(rr_df) < window_size:
+        continue
+    
+    rr_values = rr_df["rr_interval_ms"].to_numpy()
+    subject = rr_df["subject"].iloc[0]
+    stress = rr_df["stress"].iloc[0]
+    
+    for start_idx in range(0, len(rr_values) - window_size + 1, window_size):
+        end_idx = start_idx + window_size
+        rr_window = rr_values[start_idx:end_idx]
+        
+        features = extract_hrv_features(pd.DataFrame({"rr_interval_ms": rr_window}))
+        features["label"] = stress
+        features["subject"] = subject
+        features["start_idx"] = start_idx
+        features["end_idx"] = end_idx
+        
+        collected_window_rows.append(features)
+
+collected_window_df = pd.DataFrame(collected_window_rows) if collected_window_rows else pd.DataFrame()
+
+print(f"WESAD data shape: {wesad_window_df.shape}")
+print(f"Collected data shape: {collected_window_df.shape}")
+
+# We combine WESAD and collected data
+combined_df = pd.concat([wesad_window_df, collected_window_df], ignore_index=True)
+print(f"Combined dataset shape: {combined_df.shape}")
+
+combined_df.to_csv("dataset/wesad_modified/combined_dataset.csv", index=False)
+
+
+# ---- PREPARE DATA FOR CLASSIFICATION ----
+df_hrv = pd.read_csv("dataset/wesad_modified/combined_dataset.csv")
+
+df_hrv = df_hrv.dropna().reset_index(drop=True)
 
 # ---- RANDOM FOREST ----
 
-df_hrv = pd.read_csv("dataset/wesad_hrv_dataset_made_10.csv")
-
-df_hrv = df_hrv[df_hrv["label"].isin([1, 2, 3, 4])].copy()
-df_hrv["stress"] = (df_hrv["label"] == 2).astype(int)
-df_hrv = df_hrv.dropna().reset_index(drop=True)
-
 feature_cols = [c for c in df_hrv.columns if c not in ["label", "subject", "stress", "start_idx", "end_idx"]]
 X = df_hrv[feature_cols]
-y = df_hrv["stress"]
+y = df_hrv["label"]
 groups = df_hrv["subject"]
+
+print(y.unique(), y.value_counts())
 
 n_splits = min(6, groups.nunique())
 if n_splits < 2:
@@ -194,3 +293,26 @@ print("Best fold accuracy:", best_score)
 print("Best forest kept in variable: best_forest")
 
 stress_classifier = best_forest
+
+# Test best_forest on the full prepared dataset
+y_pred_all = best_forest.predict(X)
+
+print("Accuracy on full dataset:", accuracy_score(y, y_pred_all))
+print(classification_report(y, y_pred_all))
+
+cm = confusion_matrix(y, y_pred_all)
+
+plt.figure(figsize=(6, 5))
+sns.heatmap(
+    cm,
+    annot=True,
+    fmt="d",
+    cmap="Blues",
+    xticklabels=["Non-stress", "Stress"],
+    yticklabels=["Non-stress", "Stress"],
+)
+plt.title("Confusion Matrix - best_forest (full dataset)")
+plt.xlabel("Predicted")
+plt.ylabel("True")
+plt.tight_layout()
+plt.show()
