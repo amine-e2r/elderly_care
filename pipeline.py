@@ -6,7 +6,72 @@ from sklearn.pipeline import Pipeline
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.preprocessing import StandardScaler
 
-# Recolt the data via Bluetooth
+import asyncio
+from bleak import BleakScanner, BleakClient
+
+# Collect data via Bluetooth
+collected_rr = []
+collected_ecg = []
+
+# Standard and proprietary Polar UUIDs
+HR_UUID = "00002a37-0000-1000-8000-00805f9b34fb"
+PMD_CONTROL = "fb005c81-02e7-f387-1cad-8acd2d8df0c8"
+PMD_DATA = "fb005c82-02e7-f387-1cad-8acd2d8df0c8"
+
+# Command to start ECG (130Hz, 24-bit)
+ECG_START_CMD = bytearray([0x02, 0x01, 0x00, 0x01, 0x82, 0x00, 0x01, 0x01, 0x0E, 0x00])
+
+async def collect_bluetooth_data(address, duration_seconds=30):
+    collected_rr.clear()
+    collected_ecg.clear()
+
+    print(f"Connecting to device {address}...")
+    async with BleakClient(address, timeout=30.0) as client:
+        if not client.is_connected:
+            raise Exception("Unable to connect to Polar H10")
+
+        # --- RR Intervals + Heart Rate Callback ---
+        def hr_callback(sender, data):
+            flag = data[0]
+            # RR Intervals are present if bit 4 is set
+            has_rr = (flag & 0x10) != 0
+            if has_rr:
+                # RR starts after flag (1 byte) and BPM (1 or 2 bytes)
+                offset = 2 if not (flag & 0x01) else 3
+                while offset + 1 < len(data):
+                    # Value in 1/1024 seconds, converted to ms
+                    rr_raw = int.from_bytes(data[offset:offset+2], "little")
+                    rr_ms = (rr_raw / 1024.0) * 1000.0
+                    collected_rr.append(rr_ms)
+                    offset += 2
+
+        # --- Raw ECG Callback ---
+        def ecg_callback(sender, data):
+            # H10 sends packets with a 10-byte header
+            # ECG data starts at index 10. Each sample is 3 bytes (24-bit).
+            for i in range(10, len(data) - 2, 3):
+                # 24-bit signed conversion
+                sample = int.from_bytes(data[i:i+3], byteorder='little', signed=True)
+                collected_ecg.append(sample)
+
+        # Start notifications
+        print("Starting data streams...")
+        await client.start_notify(HR_UUID, hr_callback)
+        
+        # Write to PMD_CONTROL to request ECG
+        await client.write_gatt_char(PMD_CONTROL, ECG_START_CMD, response=True)
+        await client.start_notify(PMD_DATA, ecg_callback)
+
+        print(f"Collecting for {duration_seconds} seconds...")
+        await asyncio.sleep(duration_seconds)
+
+        # Stop streams
+        await client.stop_notify(PMD_DATA)
+        await client.stop_notify(HR_UUID)
+        
+    print("Collection completed.")
+    return np.array(collected_ecg), np.array(collected_rr)
+
 
 
 
