@@ -11,6 +11,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import joblib
 from copy import deepcopy
+import os
+os.makedirs("dataset/wesad_modified", exist_ok=True)
 
 
 #------------------------------! STRESS DETECTION !------------------------------

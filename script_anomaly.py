@@ -8,6 +8,7 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, confu
 from sklearn.preprocessing import StandardScaler
 import joblib
 
+
 #------------------------------! ANOMALY DETECTION !------------------------------
 
 # ---- PREPROCESSING ----
