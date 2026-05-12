@@ -7,7 +7,10 @@ from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.preprocessing import StandardScaler
 
 import asyncio
+import time
 from bleak import BleakScanner, BleakClient
+import sys
+import os
 
 # Collect data via Bluetooth
 collected_rr = []
@@ -17,9 +20,28 @@ collected_ecg = []
 HR_UUID = "00002a37-0000-1000-8000-00805f9b34fb"
 PMD_CONTROL = "fb005c81-02e7-f387-1cad-8acd2d8df0c8"
 PMD_DATA = "fb005c82-02e7-f387-1cad-8acd2d8df0c8"
+POLAR_DEVICE_NAME = "Polar H10"  # Device name used during BLE scanning
 
 # Command to start ECG (130Hz, 24-bit)
 ECG_START_CMD = bytearray([0x02, 0x01, 0x00, 0x01, 0x82, 0x00, 0x01, 0x01, 0x0E, 0x00])
+
+async def find_polar_h10(timeout=20):
+    # Automatically scan for a Polar H10 device by advertised BLE name.
+    print(f"Scanning for {POLAR_DEVICE_NAME} for up to {timeout} seconds...")
+
+    def polar_filter(device, adv):
+        if device.name and POLAR_DEVICE_NAME in device.name:
+            return True
+        if adv and hasattr(adv, 'local_name') and adv.local_name and POLAR_DEVICE_NAME in adv.local_name:
+            return True
+        return False
+
+    device = await BleakScanner.find_device_by_filter(polar_filter, timeout=timeout)
+    if device is None:
+        raise Exception(f"Could not find {POLAR_DEVICE_NAME} during BLE scan")
+
+    print(f"Found {POLAR_DEVICE_NAME}: {device.address}")
+    return device.address
 
 async def collect_bluetooth_data(address, duration_seconds=30):
     collected_rr.clear()
@@ -76,8 +98,19 @@ async def collect_bluetooth_data(address, duration_seconds=30):
 
 
 # Import the models
-random_forest_model = joblib.load("random_forest_model.pkl")
-isolation_forest_model = joblib.load("isolation_forest_model.pkl")
+try:
+    random_forest_model = joblib.load("random_forest_model.pkl")
+    print("Loaded random forest model for stress detection")
+except FileNotFoundError:
+    print("Warning: random_forest_model.pkl not found. Stress detection will be disabled.")
+    random_forest_model = None
+
+try:
+    isolation_forest_model = joblib.load("isolation_forest_model.pkl")
+    print("Loaded isolation forest model for anomaly detection")
+except FileNotFoundError:
+    print("Warning: isolation_forest_model.pkl not found. Anomaly detection will be disabled.")
+    isolation_forest_model = None
 
 # RR intervals extractor | Input : ECG signal | Output : RR intervals
 class RRIntervalsExtractor(BaseEstimator, TransformerMixin):
@@ -248,22 +281,53 @@ class ECGFeatureUnion(BaseEstimator, TransformerMixin):
         return np.hstack((hrv_features, morph_features))
 
 # Pipelines creation
-
 sample_rate = 130
 window_size = 10
 step_size = 5
 
-stress_pipeline = Pipeline([
-    ("rr_extractor", RRIntervalsExtractor(sample_rate=sample_rate)),
-    ("windowing", RRWindowing(window_size=window_size, step_size=step_size)),
-    ("hrv_extractor", HRVFeaturesExtractor()),
-    ("random_forest", random_forest_model)
-])
+if random_forest_model is not None:
+    stress_pipeline = Pipeline([
+        ("rr_extractor", RRIntervalsExtractor(sample_rate=sample_rate)),
+        ("windowing", RRWindowing(window_size=window_size, step_size=step_size)),
+        ("hrv_extractor", HRVFeaturesExtractor()),
+        ("random_forest", random_forest_model)
+    ])
+    print("Stress detection pipeline created")
+else:
+    print("Stress detection pipeline not created due to missing model")
 
-anomaly_pipeline = Pipeline([
-    ("features", ECGFeatureUnion(sample_rate=sample_rate, window_size=window_size, step_size=step_size)),
-    ("standard_scaler", StandardScaler()),
-    ("isolation_forest", isolation_forest_model)
-])
+if isolation_forest_model is not None:
+    anomaly_pipeline = Pipeline([
+        ("features", ECGFeatureUnion(sample_rate=sample_rate, window_size=window_size, step_size=step_size)),
+        ("standard_scaler", StandardScaler()),
+        ("isolation_forest", isolation_forest_model)
+    ])
+else:
+    print("Anomaly detection pipeline not created due to missing model")
 
 
+def run_pipeline(ecg_signal):
+    # Stress
+    stress_pred = stress_pipeline.predict(ecg_signal)
+    # Anomalie
+    anomaly_pred = anomaly_pipeline.predict(ecg_signal)
+    return stress_pred, anomaly_pred
+
+async def main():
+    # Main continuous loop for data collection and prediction.
+    # First discover the Polar H10 address automatically, then collect ECG data repeatedly.
+    try:
+        device_address = await find_polar_h10(timeout=20)
+        while True:
+            ecg_signal, _ = await collect_bluetooth_data(device_address, duration_seconds=30)
+            stress, anomaly = run_pipeline(ecg_signal)
+            print(f"Stress: {stress}, Anomaly: {anomaly}")
+            time.sleep(60)
+    except KeyboardInterrupt:
+        print("Stopping pipeline")
+    except Exception as e:
+        print(f"Pipeline error: {e}")
+
+if __name__ == "__main__":
+    # Entry point: run the async main loop.
+    asyncio.run(main())
