@@ -6,6 +6,7 @@ import seaborn as sns
 from sklearn.ensemble import IsolationForest
 from sklearn.metrics import accuracy_score, precision_score, recall_score, confusion_matrix
 from sklearn.preprocessing import StandardScaler
+import joblib
 
 #------------------------------! ANOMALY DETECTION !------------------------------
 
@@ -224,9 +225,5 @@ plt.ylabel("True")
 plt.tight_layout()
 plt.show()
 
-
-
-
-
-
-
+# save the model
+joblib.dump(isolation_forest, "isolation_forest_model.pkl")

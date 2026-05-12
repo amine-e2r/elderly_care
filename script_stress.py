@@ -9,6 +9,7 @@ from sklearn.metrics import accuracy_score, classification_report, confusion_mat
 from scipy.signal import butter, filtfilt
 import matplotlib.pyplot as plt
 import seaborn as sns
+import joblib
 from copy import deepcopy
 
 
@@ -316,3 +317,6 @@ plt.xlabel("Predicted")
 plt.ylabel("True")
 plt.tight_layout()
 plt.show()
+
+# save the model
+joblib.dump(best_forest, "random_forest_model.pkl")

@@ -9,8 +9,8 @@ from sklearn.preprocessing import StandardScaler
 import asyncio
 import time
 from bleak import BleakScanner, BleakClient
-import sys
-import os
+# import sys
+# import os
 
 # Collect data via Bluetooth
 collected_rr = []
@@ -319,10 +319,18 @@ async def main():
     try:
         device_address = await find_polar_h10(timeout=20)
         while True:
-            ecg_signal, _ = await collect_bluetooth_data(device_address, duration_seconds=30)
-            stress, anomaly = run_pipeline(ecg_signal)
-            print(f"Stress: {stress}, Anomaly: {anomaly}")
-            time.sleep(60)
+            try:
+                ecg_signal, _ = await collect_bluetooth_data(device_address, duration_seconds=30)
+                stress, anomaly = run_pipeline(ecg_signal)
+                print(f"Stress: {stress}, Anomaly: {anomaly}")
+                await asyncio.sleep(60)
+            except Exception as e:
+                print(f"Error : {e} — reconnexion in 10s...")
+                await asyncio.sleep(10)
+                try:
+                    device_address = await find_polar_h10(timeout=20)  # rescan
+                except Exception:
+                    print("Polar H10 not found")
     except KeyboardInterrupt:
         print("Stopping pipeline")
     except Exception as e:
