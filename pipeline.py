@@ -7,14 +7,13 @@ from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.preprocessing import StandardScaler
 
 import asyncio
-import time
+from datetime import datetime
+
 from bleak import BleakScanner, BleakClient
 # import sys
 # import os
 
-# Collect data via Bluetooth
-collected_rr = []
-collected_ecg = []
+
 
 # Standard and proprietary Polar UUIDs
 HR_UUID = "00002a37-0000-1000-8000-00805f9b34fb"
@@ -42,57 +41,6 @@ async def find_polar_h10(timeout=20):
 
     print(f"Found {POLAR_DEVICE_NAME}: {device.address}")
     return device.address
-
-async def collect_bluetooth_data(address, duration_seconds=30):
-    collected_rr.clear()
-    collected_ecg.clear()
-
-    print(f"Connecting to device {address}...")
-    async with BleakClient(address, timeout=30.0) as client:
-        if not client.is_connected:
-            raise Exception("Unable to connect to Polar H10")
-
-        # --- RR Intervals + Heart Rate Callback ---
-        def hr_callback(sender, data):
-            flag = data[0]
-            # RR Intervals are present if bit 4 is set
-            has_rr = (flag & 0x10) != 0
-            if has_rr:
-                # RR starts after flag (1 byte) and BPM (1 or 2 bytes)
-                offset = 2 if not (flag & 0x01) else 3
-                while offset + 1 < len(data):
-                    # Value in 1/1024 seconds, converted to ms
-                    rr_raw = int.from_bytes(data[offset:offset+2], "little")
-                    rr_ms = (rr_raw / 1024.0) * 1000.0
-                    collected_rr.append(rr_ms)
-                    offset += 2
-
-        # --- Raw ECG Callback ---
-        def ecg_callback(sender, data):
-            # H10 sends packets with a 10-byte header
-            # ECG data starts at index 10. Each sample is 3 bytes (24-bit).
-            for i in range(10, len(data) - 2, 3):
-                # 24-bit signed conversion
-                sample = int.from_bytes(data[i:i+3], byteorder='little', signed=True)
-                collected_ecg.append(sample)
-
-        # Start notifications
-        print("Starting data streams...")
-        await client.start_notify(HR_UUID, hr_callback)
-        
-        # Write to PMD_CONTROL to request ECG
-        await client.write_gatt_char(PMD_CONTROL, ECG_START_CMD, response=True)
-        await client.start_notify(PMD_DATA, ecg_callback)
-
-        print(f"Collecting for {duration_seconds} seconds...")
-        await asyncio.sleep(duration_seconds)
-
-        # Stop streams
-        await client.stop_notify(PMD_DATA)
-        await client.stop_notify(HR_UUID)
-        
-    print("Collection completed.")
-    return np.array(collected_ecg), np.array(collected_rr)
 
 
 
@@ -285,6 +233,11 @@ sample_rate = 130
 window_size = 10
 step_size = 5
 
+WINDOW_SAMPLES = sample_rate * 10  # Minimum 10 seconds of ECG signal
+
+ecg_buffer = []   # raw ECG signal
+rr_buffer  = []   # RR intervals
+
 if random_forest_model is not None:
     stress_pipeline = Pipeline([
         ("rr_extractor", RRIntervalsExtractor(sample_rate=sample_rate)),
@@ -306,36 +259,86 @@ else:
     print("Anomaly detection pipeline not created due to missing model")
 
 
-def run_pipeline(ecg_signal):
-    # Stress
-    stress_pred = stress_pipeline.predict(ecg_signal)
-    # Anomalie
-    anomaly_pred = anomaly_pipeline.predict(ecg_signal)
-    return stress_pred, anomaly_pred
+# Real-time analysis
+def analyze_window():
+    ecg = np.array(ecg_buffer)
 
-async def main():
-    # Main continuous loop for data collection and prediction.
-    # First discover the Polar H10 address automatically, then collect ECG data repeatedly.
+    if len(ecg) < WINDOW_SAMPLES:
+        return   # not enough data
+
+    ts = datetime.now().strftime("%H:%M:%S")
+    results = []
+
     try:
-        device_address = await find_polar_h10(timeout=20)
-        while True:
-            try:
-                ecg_signal, _ = await collect_bluetooth_data(device_address, duration_seconds=30)
-                stress, anomaly = run_pipeline(ecg_signal)
-                print(f"Stress: {stress}, Anomaly: {anomaly}")
-                await asyncio.sleep(60)
-            except Exception as e:
-                print(f"Error : {e} — reconnexion in 10s...")
-                await asyncio.sleep(10)
-                try:
-                    device_address = await find_polar_h10(timeout=20)  # rescan
-                except Exception:
-                    print("Polar H10 not found")
-    except KeyboardInterrupt:
-        print("Stopping pipeline")
+        if random_forest_model:
+            stress = stress_pipeline.predict(ecg)
+            label  = "STRESS" if 1 in stress else "Normal"
+            results.append(f"Stress: {label}")
     except Exception as e:
-        print(f"Pipeline error: {e}")
+        results.append(f"Stress: error ({e})")
+
+    try:
+        if isolation_forest_model:
+            anomaly = anomaly_pipeline.predict(ecg)
+            # Isolation Forest returns -1 for anomaly
+            label   = "ANOMALIE" if -1 in anomaly else "Normal"
+            results.append(f"Anomalie: {label}")
+    except Exception as e:
+        results.append(f"Anomaly: error ({e})")
+
+    print(f"\n[{ts}] ── Analyse ──")
+    for r in results:
+        print(f"  {r}")
+    print(f"  ECG samples : {len(ecg)} | RR intervals : {len(rr_buffer)}")
+
+
+async def stream(address):
+    print(f"Connecting to {address}...")
+    async with BleakClient(address, timeout=30.0) as client:
+
+        def hr_callback(sender, data):
+            flag   = data[0]
+            has_rr = (flag & 0x10) != 0
+            if has_rr:
+                offset = 3 if (flag & 0x01) else 2
+                while offset + 1 < len(data):
+                    rr_ms = int.from_bytes(data[offset:offset+2], "little") / 1024.0 * 1000.0
+                    rr_buffer.append(rr_ms)
+                    offset += 2
+
+        def ecg_callback(sender, data):
+            for i in range(10, len(data)-2, 3):
+                ecg_buffer.append(int.from_bytes(data[i:i+3], "little", signed=True))
+
+            # Analyze as soon as we have enough data
+            if len(ecg_buffer) >= WINDOW_SAMPLES:
+                analyze_window()
+                # Keep only the latest samples (sliding window)
+                del ecg_buffer[:step_size * sample_rate]
+
+        await client.start_notify(HR_UUID, hr_callback)
+        await client.write_gatt_char(PMD_CONTROL, ECG_START_CMD, response=True)
+        await client.start_notify(PMD_DATA, ecg_callback)
+
+        print("Streaming in progress — Ctrl+C to stop\n")
+        while True:
+            await asyncio.sleep(1)  # runs indefinitely
+            
+
+
+# ── Main ──
+# Main
+async def main():
+    while True:
+        try:
+            address = await find_polar_h10()
+            await stream(address)
+        except KeyboardInterrupt:
+            print("\nStopping the pipeline")
+            break
+        except Exception as e:
+            print(f"Error: {e} — reconnecting in 10s...")
+            await asyncio.sleep(10)
 
 if __name__ == "__main__":
-    # Entry point: run the async main loop.
     asyncio.run(main())
