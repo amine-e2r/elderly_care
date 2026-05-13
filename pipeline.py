@@ -293,6 +293,14 @@ def analyze_window():
 
 
 async def stream(address):
+        # ✅ Lister tous les services et caractéristiques disponibles
+    print("\n── Services disponibles sur le H10 ──")
+    for service in client.services:
+        print(f"  Service: {service.uuid}")
+        for char in service.characteristics:
+            print(f"    Caractéristique: {char.uuid} | Propriétés: {char.properties}")
+    print("─────────────────────────────────────\n")
+    
     print(f"Connecting to {address}...")
     async with BleakClient(address, timeout=30.0) as client:
 
@@ -305,13 +313,11 @@ async def stream(address):
                     rr_ms = int.from_bytes(data[offset:offset+2], "little") / 1024.0 * 1000.0
                     rr_buffer.append(rr_ms)
                     offset += 2
-            print(f"  HR reçu — RR buffer: {len(rr_buffer)}")
 
         def ecg_callback(sender, data):
             for i in range(10, len(data)-2, 3):
                 ecg_buffer.append(int.from_bytes(data[i:i+3], "little", signed=True))
 
-            print(f"  ECG reçu — buffer: {len(ecg_buffer)}/{WINDOW_SAMPLES}")
             
             # Analyze as soon as we have enough data
             if len(ecg_buffer) >= WINDOW_SAMPLES:
