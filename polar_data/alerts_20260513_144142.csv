@@ -1,0 +1,2 @@
+timestamp,level,type,reason,hr_bpm,activity
+2026-05-13 14:44:33,CRITICAL,FALL,Impact 3334 mG | free-fall 411 mG | std sau 0 mG,64,WALK

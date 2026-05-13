@@ -226,5 +226,6 @@ plt.ylabel("True")
 plt.tight_layout()
 plt.show()
 
-# save the model
+# save the model and scaler
 joblib.dump(isolation_forest, "isolation_forest_model.pkl")
+joblib.dump(scaler, "anomaly_scaler.pkl")
