@@ -10,9 +10,6 @@ import asyncio
 from datetime import datetime
 
 from bleak import BleakScanner, BleakClient
-# import sys
-# import os
-
 
 
 # Standard and proprietary Polar UUIDs
@@ -21,8 +18,50 @@ PMD_CONTROL = "fb005c81-02e7-f387-1cad-8acd2d8df0c8"
 PMD_DATA = "fb005c82-02e7-f387-1cad-8acd2d8df0c8"
 POLAR_DEVICE_NAME = "Polar H10"  # Device name used during BLE scanning
 
-# Command to start ECG (130Hz, 24-bit)
-ECG_START_CMD = bytearray([0x02, 0x01, 0x00, 0x01, 0x82, 0x00, 0x01, 0x01, 0x0E, 0x00])
+# Polar PMD constants — same layout used by the working ecg_acc_collector.
+PMD_START_OP = 0x02
+PMD_STOP_OP  = 0x03
+TYPE_ECG     = 0x00
+TYPE_ACC     = 0x02
+SETTING_SAMPLE_RATE = 0x00
+SETTING_RESOLUTION  = 0x01
+
+FS_ECG = 130  # Hz
+
+def _pmd_setting(setting_type: int, value: int) -> list[int]:
+    return [setting_type, 0x01, value & 0xFF, (value >> 8) & 0xFF]
+
+def build_pmd_start(measurement_type: int, settings: list[tuple[int, int]]) -> bytearray:
+    cmd = [PMD_START_OP, measurement_type]
+    for st, v in settings:
+        cmd.extend(_pmd_setting(st, v))
+    return bytearray(cmd)
+
+# ECG: 130 Hz, 14-bit. H10 transmits each sample as 3-byte signed LE.
+ECG_START_CMD = build_pmd_start(TYPE_ECG, [
+    (SETTING_SAMPLE_RATE, FS_ECG),
+    (SETTING_RESOLUTION, 14),
+])
+ECG_STOP_CMD = bytearray([PMD_STOP_OP, TYPE_ECG])
+ACC_STOP_CMD = bytearray([PMD_STOP_OP, TYPE_ACC])
+
+def parse_ecg_packet(data: bytes) -> list[int]:
+    """Decode a PMD ECG notification into a list of µV samples.
+
+    Frame layout:
+      byte 0     : measurement type (low 6 bits = 0x00 for ECG)
+      bytes 1-8  : timestamp uint64 LE
+      byte 9     : frame type
+      byte 10+   : samples, 3 bytes/sample (int24 LE signed)
+    """
+    if len(data) < 13 or (data[0] & 0x3F) != TYPE_ECG:
+        return []
+    samples = []
+    offset = 10
+    while offset + 2 < len(data):
+        samples.append(int.from_bytes(data[offset:offset+3], "little", signed=True))
+        offset += 3
+    return samples
 
 async def find_polar_h10(timeout=20):
     # Automatically scan for a Polar H10 device by advertised BLE name.
@@ -293,18 +332,26 @@ def analyze_window():
 
 
 async def stream(address):
-        # ✅ Lister tous les services et caractéristiques disponibles
-    print("\n── Services disponibles sur le H10 ──")
-    for service in client.services:
-        print(f"  Service: {service.uuid}")
-        for char in service.characteristics:
-            print(f"    Caractéristique: {char.uuid} | Propriétés: {char.properties}")
-    print("─────────────────────────────────────\n")
-    
     print(f"Connecting to {address}...")
     async with BleakClient(address, timeout=30.0) as client:
+        # Lister tous les services et caractéristiques disponibles
+        print("\n── Services disponibles sur le H10 ──")
+        for service in client.services:
+            print(f"  Service: {service.uuid}")
+            for char in service.characteristics:
+                print(f"    Caractéristique: {char.uuid} | Propriétés: {char.properties}")
+        print("─────────────────────────────────────\n")
+
+        state = {
+            "since_last": 0,    # samples accumulated since the last progress line
+            "hr_seen": False,
+            "ecg_seen": False,
+        }
 
         def hr_callback(sender, data):
+            if not state["hr_seen"]:
+                state["hr_seen"] = True
+                print(f"First HR packet received ({len(data)} bytes)")
             flag   = data[0]
             has_rr = (flag & 0x10) != 0
             if has_rr:
@@ -315,23 +362,127 @@ async def stream(address):
                     offset += 2
 
         def ecg_callback(sender, data):
-            for i in range(10, len(data)-2, 3):
-                ecg_buffer.append(int.from_bytes(data[i:i+3], "little", signed=True))
+            raw = bytes(data)
+            samples = parse_ecg_packet(raw)
+            if not samples:
+                return
+            if not state["ecg_seen"]:
+                state["ecg_seen"] = True
+                print(f"First ECG packet received "
+                      f"({len(raw)} bytes, {len(samples)} samples, "
+                      f"head={raw[:14].hex()})")
 
-            
+            ecg_buffer.extend(samples)
+            state["since_last"] += len(samples)
+
+            # Every ~1 s of incoming data, show a live progress line.
+            if state["since_last"] >= sample_rate:
+                ts = datetime.now().strftime("%H:%M:%S")
+                print(
+                    f"[{ts}] ECG samples: {len(ecg_buffer):>5} / {WINDOW_SAMPLES}"
+                    f" | RR: {len(rr_buffer)}",
+                    flush=True,
+                )
+                state["since_last"] = 0
+
             # Analyze as soon as we have enough data
             if len(ecg_buffer) >= WINDOW_SAMPLES:
                 analyze_window()
                 # Keep only the latest samples (sliding window)
                 del ecg_buffer[:step_size * sample_rate]
 
-        await client.start_notify(HR_UUID, hr_callback)
-        await client.write_gatt_char(PMD_CONTROL, ECG_START_CMD, response=True)
+        def pmd_control_callback(sender, data):
+            # Polar PMD response: [0xF0, op, meas_type, error, ...settings]
+            # Mask measurement_type with 0x3F because the high bits carry flags.
+            raw = bytes(data)
+            hex_str = raw.hex()
+            if len(raw) >= 4 and raw[0] == 0xF0:
+                op   = raw[1]
+                meas = raw[2] & 0x3F
+                err  = raw[3]
+                op_name = {PMD_START_OP: "START", PMD_STOP_OP: "STOP"}.get(op, f"0x{op:02x}")
+                meas_name = {TYPE_ECG: "ECG", TYPE_ACC: "ACC"}.get(meas, f"0x{meas:02x}")
+                status = "SUCCESS" if err == 0 else f"ERROR 0x{err:02x}"
+                print(f"PMD response: {op_name} {meas_name} → {status}  ({hex_str})")
+            else:
+                print(f"PMD control: {hex_str}")
+
+        # Subscribe to all notifications BEFORE writing PMD commands —
+        # this is the order proven to work in ecg_acc_collector.py.
+        try:
+            await client.start_notify(HR_UUID, hr_callback)
+            print("  ✓ HR notify: ACTIVE")
+        except Exception as e:
+            print(f"  ⚠ HR notify skipped: {e}")
+        try:
+            await client.start_notify(PMD_CONTROL, pmd_control_callback)
+            print("  ✓ PMD control notify: ACTIVE")
+        except Exception as e:
+            print(f"  ⚠ PMD control notify skipped: {e}")
         await client.start_notify(PMD_DATA, ecg_callback)
+        print("  ✓ PMD data notify: ACTIVE")
+
+        # Clear any stale streams left by previous runs. Stop both ECG and
+        # ACC because either one being stuck blocks new START commands with
+        # error 0x06 (INVALID_STATE). Errors here are non-fatal.
+        for stop_cmd, name in ((ECG_STOP_CMD, "ECG"), (ACC_STOP_CMD, "ACC")):
+            try:
+                await client.write_gatt_char(PMD_CONTROL, stop_cmd, response=True)
+                await asyncio.sleep(0.2)
+            except Exception:
+                pass
+
+        # START ECG
+        try:
+            await client.write_gatt_char(PMD_CONTROL, ECG_START_CMD, response=True)
+            await asyncio.sleep(0.5)
+            print("  ✓ ECG 130 Hz START sent")
+        except Exception as e:
+            print(f"  ⚠ START write failed: {e}")
 
         print("Streaming in progress — Ctrl+C to stop\n")
+        elapsed = 0
+        warned_5s = False
+        retried = False
         while True:
-            await asyncio.sleep(1)  # runs indefinitely
+            await asyncio.sleep(1)
+            elapsed += 1
+
+            # 5 s: nothing yet — likely strap / skin contact issue.
+            if not state["ecg_seen"] and elapsed >= 5 and not warned_5s:
+                print(
+                    "⚠ No ECG packets after 5 s. Check that:\n"
+                    "   • the H10 pod is snapped onto a moistened chest strap,\n"
+                    "   • the strap is worn (electrodes touching skin),\n"
+                    "   • no other app (Polar Flow / Polar Beat) is connected\n"
+                    "     to the H10 at the same time."
+                )
+                warned_5s = True
+
+            # 10 s: still nothing — retry START once in case the first
+            # write was rejected because the H10 was mid-state-transition.
+            if not state["ecg_seen"] and elapsed >= 10 and not retried:
+                retried = True
+                print("Retrying START_MEASUREMENT...")
+                try:
+                    await client.write_gatt_char(
+                        PMD_CONTROL, ECG_STOP_CMD, response=True
+                    )
+                    await asyncio.sleep(1.0)
+                    await client.write_gatt_char(
+                        PMD_CONTROL, ECG_START_CMD, response=True
+                    )
+                except Exception as e:
+                    print(f"Retry failed: {e}")
+
+            # 20 s: give up — ask user to power-cycle the H10.
+            if not state["ecg_seen"] and elapsed >= 20:
+                print(
+                    "⚠ Still no ECG after 20 s. Power-cycle the H10:\n"
+                    "   take the pod off the strap (or the strap off the body)\n"
+                    "   for ~30 s, then put it back on and rerun."
+                )
+                break
             
 
 
