@@ -268,11 +268,11 @@ class ECGFeatureUnion(BaseEstimator, TransformerMixin):
         return np.hstack((hrv_features, morph_features))
 
 # Pipelines creation
-sample_rate = 130
-window_size = 10
-step_size = 5
+sample_rate    = 130
+window_size    = 30   # 30 RR intervals ≈ 30 secondes
+step_size      = 15   # analyse toutes les 15 secondes
+WINDOW_SAMPLES = sample_rate * 30  # 3900 samples = 30 secondes d'ECG
 
-WINDOW_SAMPLES = sample_rate * 10  # Minimum 10 seconds of ECG signal
 
 ecg_buffer = []   # raw ECG signal
 rr_buffer  = []   # RR intervals

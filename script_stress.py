@@ -129,7 +129,7 @@ def extract_hrv_features(rr_intervals_df):
 
 # We use windows of 10 intervals
 
-window_size = 10  # 10 heartbeats
+window_size = 30  # 30 heartbeats
 window_rows = []
 
 for subject, rr_df in patients_rr_intervals.items():
@@ -139,7 +139,8 @@ for subject, rr_df in patients_rr_intervals.items():
     if len(rr_values) < window_size:
         continue
 
-    for start_idx in range(0, len(rr_values) - window_size + 1, window_size):
+    for start_idx in range(0, len(rr_values) - window_size + 1, 15):
+
         end_idx = start_idx + window_size
         rr_window = rr_values[start_idx:end_idx]
         label_window = label_values[start_idx:end_idx]
@@ -219,7 +220,8 @@ for filename, rr_df in collected_rr_intervals.items():
     subject = rr_df["subject"].iloc[0]
     stress = rr_df["stress"].iloc[0]
     
-    for start_idx in range(0, len(rr_values) - window_size + 1, window_size):
+    for start_idx in range(0, len(rr_values) - window_size + 1, 15):
+
         end_idx = start_idx + window_size
         rr_window = rr_values[start_idx:end_idx]
         
