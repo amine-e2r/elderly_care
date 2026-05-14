@@ -31,7 +31,7 @@ abnormal_merged = pd.concat([mitbih_abnormal, ptbdb_abnormal], ignore_index=True
 # ---- FEATURE EXTRACTION ----
 
 # We use windows of 10 intervals
-window_size = 10
+window_size = 30
 sampling_rate_mitbih = 125
 
 def get_rr_ms(df, label_col=187, fs=125):
@@ -125,7 +125,7 @@ def extract_morphological_features(beats):
 
 
 # Combine HRV and morphological features with windows of 10 beats
-def hrv_windows(ecg_signal, peaks, rr_ms, dataset_name, target_label, win=30, step=30, fs=125):
+def hrv_windows(ecg_signal, peaks, rr_ms, dataset_name, target_label, win=30, step=15, fs=125):
     rows = []
     if len(rr_ms) < win:
         return pd.DataFrame()
@@ -154,8 +154,8 @@ def hrv_windows(ecg_signal, peaks, rr_ms, dataset_name, target_label, win=30, st
 normal_ecg, normal_peaks, normal_rr_ms = get_rr_ms(normal_merged, fs=sampling_rate_mitbih)
 abnormal_ecg, abnormal_peaks, abnormal_rr_ms = get_rr_ms(abnormal_merged, fs=sampling_rate_mitbih)
 
-normal_windowed_hrv = hrv_windows(normal_ecg, normal_peaks, normal_rr_ms, "normal_merged", 0, win=window_size, step=window_size, fs=sampling_rate_mitbih)
-abnormal_windowed_hrv = hrv_windows(abnormal_ecg, abnormal_peaks, abnormal_rr_ms, "abnormal_merged", 1, win=window_size, step=window_size, fs=sampling_rate_mitbih)
+normal_windowed_hrv = hrv_windows(normal_ecg, normal_peaks, normal_rr_ms, "normal_merged", 0, win=window_size, step=15, fs=sampling_rate_mitbih)
+abnormal_windowed_hrv = hrv_windows(abnormal_ecg, abnormal_peaks, abnormal_rr_ms, "abnormal_merged", 1, win=window_size, step=15, fs=sampling_rate_mitbih)
 
 # Creating test and train set
 
@@ -228,3 +228,4 @@ plt.show()
 
 # save the model
 joblib.dump(isolation_forest, "isolation_forest_model.pkl")
+joblib.dump(scaler, "scaler_anomaly.pkl")
