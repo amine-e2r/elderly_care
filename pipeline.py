@@ -288,14 +288,22 @@ if random_forest_model is not None:
 else:
     print("Stress detection pipeline not created due to missing model")
 
+try:
+    scaler_anomaly = joblib.load("scaler_anomaly.pkl")
+    print("Loaded scaler for anomaly detection")
+except FileNotFoundError:
+    print("Warning: scaler_anomaly.pkl not found.")
+    scaler_anomaly = None
+    
 if isolation_forest_model is not None:
     anomaly_pipeline = Pipeline([
         ("features", ECGFeatureUnion(sample_rate=sample_rate, window_size=window_size, step_size=step_size)),
-        ("standard_scaler", StandardScaler()),
+        ("standard_scaler", scaler_anomaly),
         ("isolation_forest", isolation_forest_model)
     ])
 else:
     print("Anomaly detection pipeline not created due to missing model")
+
 
 
 # Real-time analysis
