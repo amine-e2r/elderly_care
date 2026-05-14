@@ -36,6 +36,8 @@ from sklearn.preprocessing import StandardScaler
 
 from bleak import BleakClient, BleakScanner
 
+from stress_state import StressStateManager, StressConfig, StressState
+
 # ════════════════════════════════════════════════════════════════
 #  CẤU HÌNH BLE / SAMPLING
 # ════════════════════════════════════════════════════════════════
@@ -148,6 +150,10 @@ ANOMALY_WARMUP_WINDOWS = 20
 _anomaly_feature_history: deque = deque(maxlen=200)
 _anomaly_scaler: StandardScaler | None = None
 
+# Realtime post-processing for the stress classifier — smoothing, hysteresis,
+# dwell, cooldown. Replaces the previous per-window binary alert behavior.
+stress_mgr = StressStateManager(StressConfig(dt=float(STEP_SEC)))
+
 # ════════════════════════════════════════════════════════════════
 #  BUFFERS
 # ════════════════════════════════════════════════════════════════
@@ -183,7 +189,8 @@ PRED_COLS = [
     "RR_mean", "SDNN", "RMSSD", "pNN50", "LF/HF",
     "mean_amplitude", "std_amplitude", "mean_energy", "std_energy", "mean_qrs_slope",
     "activity", "vm_std",
-    "stress_pred", "stress_proba",
+    "stress_pred", "stress_proba", "stress_smooth",
+    "stress_state", "stress_score", "stress_load",
     "anomaly_pred", "anomaly_score",
     "fall_candidate", "fall_strong", "fall_peak_vm",
     "hr_context_alert",
@@ -656,18 +663,36 @@ def analyze_window() -> dict:
                 row[k] = round(v, 4)
 
             # ── STRESS ────────────────────────────────────
+            # Model output is treated as an observation, not a decision.
+            # The StressStateManager smooths, applies hysteresis + dwell,
+            # and only fires a notification on confirmed CALM/ELEVATED→STRESS.
             if stress_model is not None:
                 try:
                     x_stress = np.array([[hrv[k] for k in STRESS_FEATURES]])
-                    pred = int(stress_model.predict(x_stress)[0])
-                    proba = ""
+                    raw_pred = int(stress_model.predict(x_stress)[0])
                     if hasattr(stress_model, "predict_proba"):
-                        proba = round(float(stress_model.predict_proba(x_stress)[0, 1]), 3)
-                    row["stress_pred"]  = pred
-                    row["stress_proba"] = proba
-                    if pred == 1:
+                        proba = float(stress_model.predict_proba(x_stress)[0, 1])
+                    else:
+                        proba = float(raw_pred)
+
+                    out = stress_mgr.update(
+                        p_raw=proba,
+                        n_rr=n_rr,
+                        activity=activity,
+                        vm_std=vm_std,
+                    )
+
+                    row["stress_pred"]   = 1 if out.state == StressState.STRESS else 0
+                    row["stress_proba"]  = round(proba, 3)
+                    row["stress_smooth"] = round(out.p_smooth, 3)
+                    row["stress_state"]  = out.state.value
+                    row["stress_score"]  = out.stress_score
+                    row["stress_load"]   = round(out.load, 1)
+
+                    if out.notify:
                         _fire_alert("ALERT", "STRESS",
-                                    f"Random Forest gắn cờ STRESS (proba={proba})",
+                                    f"{out.notify_kind}: smooth_p={out.p_smooth:.2f}, "
+                                    f"load={out.load:.0f} ({out.reason})",
                                     hr_latest, activity)
                 except Exception as e:
                     row["stress_pred"] = f"err:{e}"
@@ -757,13 +782,14 @@ def display_loop():
         alert_l  = last_row.get("hr_context_alert", "SAFE") or "SAFE"
         alert_c  = ALERT_COLORS.get(alert_l, RESET)
 
-        stress_p = last_row.get("stress_pred", "—")
-        if stress_p == 1:
-            stress_str = f"\033[1;91mSTRESS\033[0m"
-        elif stress_p == 0:
-            stress_str = f"\033[92mNormal\033[0m"
-        else:
-            stress_str = str(stress_p)
+        stress_state_str = last_row.get("stress_state", "—")
+        stress_color = {
+            "CALM"    : "\033[92m",
+            "ELEVATED": "\033[93m",
+            "STRESS"  : "\033[1;91m",
+            "RECOVERY": "\033[96m",
+        }.get(stress_state_str, "\033[0m")
+        stress_str = f"{stress_color}{stress_state_str}\033[0m"
 
         anom_p = last_row.get("anomaly_pred", "—")
         if anom_p == 1:
@@ -786,7 +812,11 @@ def display_loop():
         print(f"  🏃 Activity   : {activity}  (VM_std={vm_std:.0f} mG)")
         print(f"  ⚡ HR alert   : {alert_c}{alert_l}{RESET}")
         print()
-        print(f"  🧠 Stress     : {stress_str}    proba={last_row.get('stress_proba','—')}")
+        print(f"  🧠 Stress     : {stress_str}    "
+              f"score={last_row.get('stress_score','—')}/100  "
+              f"load={last_row.get('stress_load','—')}  "
+              f"p_smooth={last_row.get('stress_smooth','—')}  "
+              f"p_raw={last_row.get('stress_proba','—')}")
         print(f"  🩺 Anomaly    : {anom_str}    score={last_row.get('anomaly_score','—')}")
         print()
         rr_mean = last_row.get("RR_mean", "—")
